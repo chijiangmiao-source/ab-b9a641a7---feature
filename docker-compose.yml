@@ -1,0 +1,34 @@
+# Deep-sea buoy reachability-audit: API service + one-shot verifier.
+#
+#   docker compose up --build app                 # serve on HOST_PORT (default 8080)
+#   HOST_PORT=9000 docker compose up --build app  # host port is configurable
+#   docker compose up --build --exit-code-from verify
+#                                                 # app + verify; verify runs
+#                                                 # tests/build/HTTP smoke and
+#                                                 # exits, its code is reported
+services:
+  app:
+    build: .
+    image: reachability-audit:latest
+    environment:
+      PORT: 8080
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    image: reachability-audit:latest
+    build: .
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://app:8080
+    command: ["python", "-m", "verify.verify"]
+    restart: "no"
