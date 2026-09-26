@@ -9,8 +9,13 @@ Runs three stages and exits non-zero if any of them fails:
                    http://app:8080): health endpoint, exact fraction
                    probabilities (1/3, 2/3, certain rescue), canonical
                    lexicographic action on ties, zero rescue probability and
-                   closed-loop identification, and locatable 400 failures
-                   that must not produce success certificates.
+                   closed-loop identification, locatable 400 failures that
+                   must not produce success certificates, and the robust
+                   (interval-valued) audit: item-by-item agreement with the
+                   plain audit on degenerate point intervals, exact lower
+                   bounds for shiftable probability mass, zero probability
+                   for interval closed loops, and locatable 400 failures for
+                   interval sums that admit no distribution.
 
 The process exits after the run and prints VERIFY_EXIT_CODE so that
 `docker compose up --exit-code-from verify` (or a shell) can report it.
@@ -28,6 +33,7 @@ import urllib.request
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASE_URL = os.environ.get("BASE_URL", "http://app:8080").rstrip("/")
 AUDIT_URL = BASE_URL + "/api/reachability-audit"
+ROBUST_AUDIT_URL = BASE_URL + "/api/robust-reachability-audit"
 HEALTH_URL = BASE_URL + "/health"
 
 _failures = []
@@ -227,6 +233,144 @@ def stage_http_smoke():
         status, body = http_post(AUDIT_URL, payload)
         error = body.get("error", {})
         check("invalid model rejected: %s" % label,
+              status == 400
+              and body.get("ok") is False
+              and error.get("code") == code
+              and error.get("path")
+              and "certificates" not in body
+              and "maxRescueProbability" not in body,
+              "status=%s body=%s" % (status, json.dumps(body)[:200]))
+
+    stage_robust_http_smoke()
+
+
+def _intervalise(actions):
+    """Exact distributions -> equivalent point-interval robust actions."""
+    return {s: {a: {t: {"lower": p, "upper": p} for t, p in dist.items()}
+                for a, dist in state_actions.items()}
+            for s, state_actions in actions.items()}
+
+
+def _strip_worst_distributions(body):
+    """Copy a robust-audit reply without its (extra) worstDistribution
+    entries, so it can be compared with the plain audit item by item."""
+    stripped = dict(body)
+    stripped["certificates"] = [
+        dict(cert, actions=[{k: v for k, v in entry.items()
+                             if k != "worstDistribution"}
+                            for entry in cert["actions"]])
+        for cert in body.get("certificates", [])
+    ]
+    return stripped
+
+
+def stage_robust_http_smoke():
+    print("== stage 3/3 (continued): robust interval audit against %s =="
+          % BASE_URL)
+
+    # -- degenerate point intervals: item-by-item agreement with the audit --
+    actions = {
+        "s0": {"commit": {"s1": "2/3", "lost": "1/3"}},
+        "s1": {"retry": {"rescued": "1/2", "s1": "1/2"}},
+        "s2": {"call": {"rescued": "1/3", "lost": "2/3"}},
+    }
+    base = {"states": ["s0", "s1", "s2", "rescued", "lost"], "start": "s0",
+            "rescuedStates": ["rescued"], "lostStates": ["lost"]}
+    status_exact, exact = http_post(AUDIT_URL, dict(base, actions=actions))
+    status_robust, robust = http_post(
+        ROBUST_AUDIT_URL, dict(base, actions=_intervalise(actions)))
+    check("degenerate robust model HTTP 200",
+          status_exact == 200 and status_robust == 200,
+          "got %s/%s" % (status_exact, status_robust))
+    check("degenerate robust model agrees with plain audit item by item",
+          _strip_worst_distributions(robust) == exact,
+          "robust=%s exact=%s" % (json.dumps(robust)[:200],
+                                  json.dumps(exact)[:200]))
+    worst_ok = all(
+        entry.get("worstDistribution") == actions[cert["state"]][entry["action"]]
+        for cert in robust.get("certificates", [])
+        for entry in cert["actions"])
+    check("degenerate worst distributions equal the exact distributions",
+          bool(robust.get("certificates")) and worst_ok)
+
+    # -- mass shiftable between two successors: exact lower bound -----------
+    status, body = http_post(ROBUST_AUDIT_URL, {
+        "states": ["s0", "s1", "s2", "rescued", "lost"],
+        "start": "s0",
+        "rescuedStates": ["rescued"],
+        "lostStates": ["lost"],
+        "actions": {
+            "s0": {"commit": {"s1": {"lower": "1/4", "upper": "3/4"},
+                              "s2": {"lower": "1/4", "upper": "3/4"}}},
+            "s1": {"push": {"rescued": {"lower": "3/4", "upper": "3/4"},
+                            "lost": {"lower": "1/4", "upper": "1/4"}}},
+            "s2": {"call": {"rescued": {"lower": "1/4", "upper": "1/4"},
+                            "lost": {"lower": "3/4", "upper": "3/4"}}},
+        },
+    })
+    check("shiftable-mass model HTTP 200", status == 200,
+          "got %s" % status)
+    check("shiftable mass yields exact lower bound 3/8",
+          body.get("maxRescueProbability") == "3/8",
+          repr(body.get("maxRescueProbability")))
+    certs = {c["state"]: c for c in body.get("certificates", [])}
+    commit = (certs.get("s0", {}).get("actions") or [{}])[0]
+    check("canonical worst distribution attains the bound",
+          commit.get("worstDistribution") == {"s1": "1/4", "s2": "3/4"}
+          and commit.get("expectedValue") == "3/8",
+          repr(commit))
+
+    # -- interval closed loop: zero rescue probability ----------------------
+    status, body = http_post(ROBUST_AUDIT_URL, {
+        "states": ["s0", "loop1", "loop2", "rescued", "lost"],
+        "start": "s0",
+        "rescuedStates": ["rescued"],
+        "lostStates": ["lost"],
+        "actions": {
+            "s0": {"dive": {"loop1": {"lower": "1", "upper": "1"}}},
+            "loop1": {"drift": {"loop2": {"lower": "1/2", "upper": "1"},
+                                "loop1": {"lower": "0", "upper": "1/2"}}},
+            "loop2": {"drift": {"loop1": {"lower": "1", "upper": "1"}}},
+        },
+    })
+    check("interval closed-loop model HTTP 200", status == 200,
+          "got %s" % status)
+    check("interval closed loop keeps zero rescue probability",
+          body.get("maxRescueProbability") == "0"
+          and body.get("stateValues", {}).get("loop1") == "0"
+          and body.get("stateValues", {}).get("loop2") == "0",
+          repr(body.get("stateValues")))
+    check("interval closed loop identified as non-terminating",
+          body.get("nonTerminatingStates") == ["loop1", "loop2", "s0"],
+          repr(body.get("nonTerminatingStates")))
+
+    # -- infeasible interval sums: locatable 400, no success certificate ----
+    bad_interval_models = [
+        ("lower bounds sum above one",
+         {"states": ["s0", "rescued", "lost"], "start": "s0",
+          "rescuedStates": ["rescued"], "lostStates": ["lost"],
+          "actions": {"s0": {"go": {"rescued": {"lower": "2/3", "upper": "1"},
+                                    "lost": {"lower": "2/3", "upper": "1"}}}}},
+         "INTERVAL_SUM_INVALID"),
+        ("upper bounds sum below one",
+         {"states": ["s0", "rescued", "lost"], "start": "s0",
+          "rescuedStates": ["rescued"], "lostStates": ["lost"],
+          "actions": {"s0": {"go": {"rescued": {"lower": "0", "upper": "1/3"},
+                                    "lost": {"lower": "0", "upper": "1/3"}}}}},
+         "INTERVAL_SUM_INVALID"),
+        ("lower bound above upper bound",
+         {"states": ["s0", "rescued", "lost"], "start": "s0",
+          "rescuedStates": ["rescued"], "lostStates": ["lost"],
+          "actions": {"s0": {"go": {"rescued": {"lower": "2/3",
+                                                "upper": "1/3"},
+                                    "lost": {"lower": "1/3",
+                                             "upper": "1/3"}}}}},
+         "INTERVAL_EMPTY"),
+    ]
+    for label, payload, code in bad_interval_models:
+        status, body = http_post(ROBUST_AUDIT_URL, payload)
+        error = body.get("error", {})
+        check("invalid interval model rejected: %s" % label,
               status == 400
               and body.get("ok") is False
               and error.get("code") == code

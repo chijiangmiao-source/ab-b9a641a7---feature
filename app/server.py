@@ -2,8 +2,9 @@
 
 Endpoints
 ---------
-GET  /health                    liveness probe used by Docker/Compose
-POST /api/reachability-audit    exact maximum-rescue-probability audit
+GET  /health                           liveness probe used by Docker/Compose
+POST /api/reachability-audit           exact maximum-rescue-probability audit
+POST /api/robust-reachability-audit    exact robust (interval-valued) audit
 
 The audit endpoint accepts one JSON model: unique states, a start state,
 rescued and lost terminal states, and for every controllable (non-terminal)
@@ -16,6 +17,18 @@ states without actions, terminals carrying actions, transition probabilities
 that do not sum to exactly one, ...) are rejected with a locatable error and
 never produce a success certificate.
 
+The robust audit endpoint accepts the same model shape, except that every
+transition carries an interval {"lower": "p/q", "upper": "p/q"} of reduced
+fractions.  Every action's intervals must admit a distribution summing to
+exactly one (sum of lower bounds <= 1 <= sum of upper bounds), otherwise the
+model is rejected with an error located at the offending action or target
+state.  The reply is the exact controller-maximising / perturbation-
+minimising infinite-horizon rescue probability: after every action the
+perturbation may re-select any distribution inside the intervals.  Each
+certificate action additionally lists the canonical worst-case distribution
+attaining its expected value.  For point intervals (lower == upper
+everywhere) the robust reply agrees with the plain audit item by item.
+
 Only the Python standard library is used; all arithmetic is exact rational
 arithmetic via fractions.Fraction.
 """
@@ -26,9 +39,10 @@ import re
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .solver import solve_reachability
+from .solver import solve_reachability, solve_robust_reachability
 
 AUDIT_PATH = "/api/reachability-audit"
+ROBUST_AUDIT_PATH = "/api/robust-reachability-audit"
 HEALTH_PATH = "/health"
 
 _FRACTION_RE = re.compile(r"^([+-]?\d+)(?:/(\d+))?$")
@@ -78,11 +92,11 @@ def _require(condition, code, message, path):
         raise ClientError(code, message, path)
 
 
-def _parse_probability(value, path):
+def _parse_probability(value, path, what="probability"):
     if isinstance(value, bool):
         raise ClientError("INVALID_FRACTION",
-                          "probability must be a reduced fraction string "
-                          "'p/q', not a boolean", path)
+                          "%s must be a reduced fraction string "
+                          "'p/q', not a boolean" % what, path)
     if isinstance(value, int):
         frac = Fraction(value)
     elif isinstance(value, str):
@@ -90,30 +104,33 @@ def _parse_probability(value, path):
         if not match:
             raise ClientError(
                 "INVALID_FRACTION",
-                "probability %r is not a fraction of the form 'p' or 'p/q'"
-                % value, path)
+                "%s %r is not a fraction of the form 'p' or 'p/q'"
+                % (what, value), path)
         numerator = int(match.group(1))
         denominator = int(match.group(2)) if match.group(2) else 1
         if denominator == 0:
             raise ClientError("INVALID_FRACTION",
-                              "probability %r has a zero denominator" % value,
+                              "%s %r has a zero denominator" % (what, value),
                               path)
         frac = Fraction(numerator, denominator)
     else:
         raise ClientError(
             "INVALID_FRACTION",
-            "probability must be a reduced fraction string 'p/q'; "
-            "floating-point values are not accepted", path)
+            "%s must be a reduced fraction string 'p/q'; "
+            "floating-point values are not accepted" % what, path)
     if not (Fraction(0) <= frac <= Fraction(1)):
         raise ClientError("INVALID_PROBABILITY",
-                          "probability %s is outside [0, 1]" % frac, path)
+                          "%s %s is outside [0, 1]" % (what, frac), path)
     return frac
 
 
-def parse_model(payload):
-    """Validate the request payload and return the exact rational model.
+def _parse_common(payload):
+    """Validate everything the two audit variants share: unique states, the
+    start state, disjoint rescued/lost terminals and the actions envelope.
 
-    Raises :class:`ClientError` with a locatable path on any failure.
+    Returns ``(states, state_set, start, rescued, lost, terminals,
+    raw_actions)``.  Raises :class:`ClientError` with a locatable path on any
+    failure.
     """
     _require(isinstance(payload, dict), "INVALID_SCHEMA",
              "request body must be a JSON object", None)
@@ -171,12 +188,18 @@ def parse_model(payload):
              % sorted(overlap), "rescuedStates")
     terminals = set(rescued) | set(lost)
 
-    # ---- actions ---------------------------------------------------------
+    # ---- actions envelope --------------------------------------------------
     raw_actions = payload["actions"]
     _require(isinstance(raw_actions, dict), "INVALID_SCHEMA",
              "'actions' must be an object mapping state -> action -> "
              "transition distribution", "actions")
 
+    return states, state_set, start, rescued, lost, terminals, raw_actions
+
+
+def _parse_actions(raw_actions, state_set, terminals, parse_dist):
+    """Validate the per-state/per-action structure and parse every action's
+    transitions with ``parse_dist(state, action_id, dist, apath)``."""
     actions = {}
     for state, state_actions in raw_actions.items():
         path = "actions.%s" % state
@@ -194,30 +217,120 @@ def parse_model(payload):
             _require(isinstance(action_id, str) and action_id,
                      "INVALID_SCHEMA", "action identifiers must be non-empty "
                      "strings", apath)
-            _require(isinstance(dist, dict), "INVALID_SCHEMA",
-                     "transition distribution of action %r must be an object "
-                     "mapping state -> fraction" % action_id, apath)
-            parsed_dist = {}
-            total = Fraction(0)
-            for target, raw_prob in dist.items():
-                tpath = "%s.%s" % (apath, target)
-                _require(target in state_set, "UNKNOWN_STATE_REFERENCE",
-                         "transition target %r is not declared in 'states'"
-                         % target, tpath)
-                prob = _parse_probability(raw_prob, tpath)
-                parsed_dist[target] = prob
-                total += prob
-            _require(total == 1, "PROBABILITY_SUM_INVALID",
-                     "transition probabilities of action %r in state %r sum "
-                     "to %s, not exactly 1" % (action_id, state, total), apath)
-            parsed_state_actions[action_id] = parsed_dist
+            parsed_state_actions[action_id] = parse_dist(
+                state, action_id, dist, apath)
         actions[state] = parsed_state_actions
+    return actions
 
+
+def _require_action_coverage(states, terminals, actions):
     for state in states:
         if state not in terminals:
             _require(state in actions, "NONTERMINAL_MISSING_ACTIONS",
                      "controllable state %r has no actions" % state,
                      "actions.%s" % state)
+
+
+def parse_model(payload):
+    """Validate the request payload and return the exact rational model.
+
+    Raises :class:`ClientError` with a locatable path on any failure.
+    """
+    (states, state_set, start, rescued, lost, terminals,
+     raw_actions) = _parse_common(payload)
+
+    def parse_dist(state, action_id, dist, apath):
+        _require(isinstance(dist, dict), "INVALID_SCHEMA",
+                 "transition distribution of action %r must be an object "
+                 "mapping state -> fraction" % action_id, apath)
+        parsed_dist = {}
+        total = Fraction(0)
+        for target, raw_prob in dist.items():
+            tpath = "%s.%s" % (apath, target)
+            _require(target in state_set, "UNKNOWN_STATE_REFERENCE",
+                     "transition target %r is not declared in 'states'"
+                     % target, tpath)
+            prob = _parse_probability(raw_prob, tpath)
+            parsed_dist[target] = prob
+            total += prob
+        _require(total == 1, "PROBABILITY_SUM_INVALID",
+                 "transition probabilities of action %r in state %r sum "
+                 "to %s, not exactly 1" % (action_id, state, total), apath)
+        return parsed_dist
+
+    actions = _parse_actions(raw_actions, state_set, terminals, parse_dist)
+    _require_action_coverage(states, terminals, actions)
+
+    return {
+        "states": states,
+        "start": start,
+        "rescued": rescued,
+        "lost": lost,
+        "actions": actions,
+    }
+
+
+def parse_interval_model(payload):
+    """Validate a robust-audit payload and return the interval model.
+
+    Same structure as :func:`parse_model`, except every transition maps its
+    target to ``{"lower": "p/q", "upper": "p/q"}``.  Each action's intervals
+    must admit a distribution summing to exactly one: lower bounds summing
+    to more than 1 or upper bounds summing to less than 1 are rejected with
+    ``INTERVAL_SUM_INVALID`` located at the action; a lower bound above its
+    upper bound is rejected with ``INTERVAL_EMPTY`` located at the target.
+    """
+    (states, state_set, start, rescued, lost, terminals,
+     raw_actions) = _parse_common(payload)
+
+    def parse_dist(state, action_id, dist, apath):
+        _require(isinstance(dist, dict), "INVALID_SCHEMA",
+                 "transition intervals of action %r must be an object "
+                 "mapping state -> {'lower': f, 'upper': f}" % action_id,
+                 apath)
+        parsed_dist = {}
+        lower_total = Fraction(0)
+        upper_total = Fraction(0)
+        for target, raw_bounds in dist.items():
+            tpath = "%s.%s" % (apath, target)
+            _require(target in state_set, "UNKNOWN_STATE_REFERENCE",
+                     "transition target %r is not declared in 'states'"
+                     % target, tpath)
+            _require(isinstance(raw_bounds, dict), "INVALID_SCHEMA",
+                     "interval of target %r must be an object with 'lower' "
+                     "and 'upper' bounds" % target, tpath)
+            unexpected = sorted(set(raw_bounds) - {"lower", "upper"})
+            _require(not unexpected, "INVALID_SCHEMA",
+                     "interval of target %r has unexpected keys %s"
+                     % (target, unexpected), tpath)
+            for key in ("lower", "upper"):
+                _require(key in raw_bounds, "INVALID_SCHEMA",
+                         "interval of target %r is missing the %r bound"
+                         % (target, key), "%s.%s" % (tpath, key))
+            lower = _parse_probability(raw_bounds["lower"],
+                                       "%s.lower" % tpath,
+                                       "interval lower bound")
+            upper = _parse_probability(raw_bounds["upper"],
+                                       "%s.upper" % tpath,
+                                       "interval upper bound")
+            _require(lower <= upper, "INTERVAL_EMPTY",
+                     "lower bound %s exceeds upper bound %s for target %r"
+                     % (lower, upper, target), tpath)
+            parsed_dist[target] = (lower, upper)
+            lower_total += lower
+            upper_total += upper
+        _require(lower_total <= 1, "INTERVAL_SUM_INVALID",
+                 "lower bounds of action %r in state %r sum to %s > 1; no "
+                 "distribution within the intervals sums to exactly 1"
+                 % (action_id, state, lower_total), apath)
+        _require(upper_total >= 1, "INTERVAL_SUM_INVALID",
+                 "upper bounds of action %r in state %r sum to %s < 1; no "
+                 "distribution within the intervals sums to exactly 1"
+                 % (action_id, state, upper_total), apath)
+        return parsed_dist
+
+    actions = _parse_actions(raw_actions, state_set, terminals, parse_dist)
+    _require_action_coverage(states, terminals, actions)
 
     return {
         "states": states,
@@ -236,16 +349,28 @@ def _fmt(frac):
 def build_success_payload(result):
     certificates = []
     for cert in result["certificates"]:
+        entries = []
+        for entry in cert["actions"]:
+            item = {
+                "action": entry["action"],
+                "expectedValue": _fmt(entry["expectedValue"]),
+            }
+            if "worstDistribution" in entry:
+                # robust audits: the canonical worst-case distribution that
+                # attains this action's expected value
+                item["worstDistribution"] = {
+                    target: _fmt(prob)
+                    for target, prob in sorted(
+                        entry["worstDistribution"].items())
+                }
+            item["optimal"] = entry["optimal"]
+            item["selected"] = entry["selected"]
+            entries.append(item)
         certificates.append({
             "state": cert["state"],
             "value": _fmt(cert["value"]),
             "selectedAction": cert["selectedAction"],
-            "actions": [{
-                "action": entry["action"],
-                "expectedValue": _fmt(entry["expectedValue"]),
-                "optimal": entry["optimal"],
-                "selected": entry["selected"],
-            } for entry in cert["actions"]],
+            "actions": entries,
         })
     return {
         "ok": True,
@@ -290,15 +415,23 @@ class AuditHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "service": "reachability-audit",
                 "endpoints": {"audit": "POST " + AUDIT_PATH,
+                              "robustAudit": "POST " + ROBUST_AUDIT_PATH,
                               "health": "GET " + HEALTH_PATH},
             })
         else:
             self._send_error(404, "NOT_FOUND", "no such route: %s" % self.path)
 
     def do_POST(self):
-        if self.path != AUDIT_PATH:
+        routes = {
+            AUDIT_PATH: (parse_model, solve_reachability),
+            ROBUST_AUDIT_PATH: (parse_interval_model,
+                                solve_robust_reachability),
+        }
+        route = routes.get(self.path)
+        if route is None:
             self._send_error(404, "NOT_FOUND", "no such route: %s" % self.path)
             return
+        parse, solve = route
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
@@ -307,7 +440,7 @@ class AuditHandler(BaseHTTPRequestHandler):
         try:
             raw = self.rfile.read(length)
             payload = _loads_strict(raw.decode("utf-8"))
-            model = parse_model(payload)
+            model = parse(payload)
         except ClientError as exc:
             self._send_error(400, exc.code, exc.message, exc.path)
             return
@@ -315,9 +448,8 @@ class AuditHandler(BaseHTTPRequestHandler):
             self._send_error(400, "INVALID_REQUEST", str(exc))
             return
 
-        result = solve_reachability(model["states"], model["start"],
-                                    model["rescued"], model["lost"],
-                                    model["actions"])
+        result = solve(model["states"], model["start"], model["rescued"],
+                       model["lost"], model["actions"])
         self._send_json(200, build_success_payload(result))
 
 
