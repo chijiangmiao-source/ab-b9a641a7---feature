@@ -98,6 +98,75 @@ Error codes include `UNKNOWN_STATE_REFERENCE`,
 `DUPLICATE_STATE`, `DUPLICATE_KEY`, `TERMINAL_CONFLICT`, `INVALID_SCHEMA`,
 `INVALID_JSON`.
 
+### `POST /api/robust-reachability-audit`
+
+The *robust* audit takes the same state/action structure, but every possible
+successor of an action carries a closed probability **interval** instead of a
+point probability:
+
+```json
+{
+  "states": ["s0", "s1", "rescued", "lost"],
+  "start": "s0",
+  "rescuedStates": ["rescued"],
+  "lostStates": ["lost"],
+  "actions": {
+    "s0": {"go": {
+      "rescued": {"lower": "1/4", "upper": "1/2"},
+      "s1":      {"lower": "1/2", "upper": "3/4"}}},
+    "s1": {"sink": {"lost": {"lower": "1", "upper": "1"}}}
+  }
+}
+```
+
+After every action the link disturbance may **afresh** choose any
+distribution over the successors that (a) keeps each probability inside its
+bounds and (b) sums to exactly one.  An action's intervals are legal exactly
+when `sum lower <= 1 <= sum upper` (with `lower <= upper`); otherwise the
+request is rejected with a path locating the offending action (`400`).
+
+The service computes the **maximum rescue probability that is guaranteed no
+matter how the disturbance acts** (controller maximises, disturbance
+minimises, infinite horizon), entirely in exact rational arithmetic.  Each
+action node is a finite adversarial choice over its interval box (a polytope);
+the solver performs exact **adversary strategy iteration**: it fixes one
+canonical box-vertex policy for the disturbance, solves the resulting
+controller MDP with the same rational two-phase simplex as the ordinary
+audit, and then lets the disturbance best-respond.  The exact value vectors
+decrease monotonically and every strict step changes one of finitely many
+vertex policies, so the procedure terminates at the game value — no midpoint,
+floating point, random playout or finite-round approximation is used.
+
+Success (`200`) has the same outer shape as the ordinary audit; every
+certificate action additionally lists the **canonical worst distribution**
+(the minimising box vertex, ties broken lexicographically) together with the
+interval endpoints and the exact worst-case expectation, so the reason an
+action is selected or excluded can be recomputed directly:
+
+```json
+{"state": "s0", "value": "1/4", "selectedAction": "go",
+ "actions": [{"action": "go", "expectedValue": "1/4",
+              "optimal": true, "selected": true,
+              "worstDistribution": {
+                  "rescued": {"lower": "1/4", "upper": "1/2",
+                              "probability": "1/4"},
+                  "s1":      {"lower": "1/2", "upper": "3/4",
+                              "probability": "3/4"}}}]}
+```
+
+Guarantees:
+
+* for **point intervals** (`lower == upper`, distributions summing to one)
+  every result field matches `POST /api/reachability-audit` item for item;
+* an action whose free mass can shift between a rescue successor and a doomed
+  one returns the **exact lower bound** (the disturbance claims the slack);
+* closed loops with no feasible escape keep probability exactly `0` and are
+  reported in `nonTerminatingStates`;
+* interval boxes that cannot be normalised never produce a success
+  certificate — the failure path locates the action (`actions.<state>.<act>`),
+  and inverted/missing/malformed bounds locate the target or bound
+  (`....<target>`, `....<target>.upper`).
+
 ### `GET /health`
 
 Liveness probe: `200 {"ok": true, "status": "healthy"}`.
@@ -116,8 +185,10 @@ The `verify` service waits for `app` to be healthy, then runs the unit/API
 test suite, a byte-compile/import build check, and live HTTP smoke checks
 (exact `1/3`/`2/3` fractions, certain rescue, canonical lexicographic action
 on ties with equal expected values, zero rescue probability for the closed
-loop and the start state forced into it, and locatable `400` failures). It
-then exits and reports its exit code:
+loop and the start state forced into it, locatable `400` failures, and the
+robust interval audit: exact worst-case lower bounds with canonical worst
+distributions, point-interval equality with the ordinary audit, closed-loop
+zeros and locatable infeasibility). It then exits and reports its exit code:
 
 ```sh
 docker compose up --build --exit-code-from verify
@@ -135,10 +206,11 @@ BASE_URL=http://127.0.0.1:8080 python3 -m verify.verify
 ## Layout
 
 ```
-app/solver.py    exact rational LP (two-phase simplex) + model solver
-app/server.py    HTTP API, request validation, exact fraction rendering
-tests/           unit + API tests (unittest, stdlib only)
-verify/verify.py compose verify service: tests, build check, HTTP smoke
-Dockerfile       python:3.12-slim image with HEALTHCHECK
-docker-compose.yml  app (configurable HOST_PORT) + one-shot verify
+app/solver.py         exact rational LP (two-phase simplex) + model solver
+app/robust_solver.py  exact interval-MDP solver (adversary strategy iteration)
+app/server.py         HTTP API, request validation, exact fraction rendering
+tests/                unit + API tests for both audits (unittest, stdlib only)
+verify/verify.py      compose verify service: tests, build check, HTTP smoke
+Dockerfile            python:3.12-slim image with HEALTHCHECK
+docker-compose.yml    app (configurable HOST_PORT) + one-shot verify
 ```
